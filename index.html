@@ -314,7 +314,7 @@ function cmpVal(a,b){
 // STATE LOCAL
 // ══════════════════════════════════
 const SB_AMT=1, BB_AMT=2, START=200;
-let myColor=null, myName='', gameId=null, gameRef=null;
+let myColor=null, myName='', gameId=null, gameRef=null, resultShown=false;
 let resultShown=false;
 
 // ══════════════════════════════════
@@ -354,10 +354,23 @@ function listenGame(){
   onValue(gameRef,snap=>{
     if(!snap.exists()) return;
     const d=snap.val();
-    if(!d.p2) return; // attente
-    // p1 deal quand status=ready
-    if(d.status==='ready'&&myColor==='p1') dealHand(d);
-    else if(d.status==='playing'&&d.state) render(JSON.parse(d.state));
+    if(!d.p2) return;
+    if(d.status==='done') return;
+    if(d.status==='ready'&&myColor==='p1'){ dealHand(d); return; }
+    if(d.status==='playing'&&d.state){
+      const s=JSON.parse(d.state);
+      render(s);
+      // Si p2 a foldé et on est p1, on calcule le résultat
+      if(s.foldedBy&&myColor==='p1'&&!resultShown) computeAndWriteResult(s);
+      return;
+    }
+    if(d.status==='ended'&&d.state&&d.result&&!resultShown){
+      resultShown=true;
+      const s=JSON.parse(d.state);
+      const result=JSON.parse(d.result);
+      render(s);
+      setTimeout(()=>showResult(s,result), 600);
+    }
   });
 }
 
@@ -392,12 +405,13 @@ async function dealHand(d){
     pot:0,
     currentBet:BB_AMT,
     lastRaiseSize:BB_AMT,
-    toAct:sb,          // SB parle en 1er preflop
-    lastAggressor:bb,  // BB est le dernier agresseur initial
+    toAct:sb,       // SB parle en 1er preflop (heads-up)
+    bbHasOption:true, // BB peut check/raise après call de SB preflop
+    lastAggressor:bb,
     actions:[],
-    revealed:0,        // nb cartes communes visibles
+    revealed:0,
     foldedBy:null,
-    winner:null,       // rempli à la fin
+    winner:null,
     p1name:d.p1, p2name:d.p2,
   };
 
@@ -492,11 +506,7 @@ function render(s){
   // Actions
   renderActions(s);
 
-  // Déclenchements auto
-  if((s.foldedBy||s.phase==='showdown')&&!resultShown){
-    resultShown=true;
-    setTimeout(()=>showResult(s), 700);
-  }
+  // (résultat géré par listenGame via status='ended')
 }
 
 function mkCard(cs){
@@ -587,18 +597,22 @@ async function act(type, amount, s){
   if(type==='fold'){
     s.foldedBy=me;
     s.actions.push({p:me,t:'fold'});
-    await push(s);
+    // p1 calcule et écrit le résultat directement dans Firebase
+    if(myColor==='p1') await computeAndWriteResult(s);
+    else await push(s); // p2 fold: p1 verra le fold et calculera
     return;
   }
 
   if(type==='check'){
     s.actions.push({p:me,t:'check'});
-    // Après check: si l'adversaire a déjà checké → phase suivante
-    // Sinon: passer la main à l'adversaire
     s.toAct=op;
-    const lastAct=s.actions[s.actions.length-2];
-    if(lastAct&&(lastAct.t==='check'||lastAct.t==='call')) await nextPhase(s);
-    else await push(s);
+    // Round terminé si l'adversaire avait déjà checké (action précédente = check de op)
+    const prevAct=s.actions[s.actions.length-2];
+    if(prevAct&&prevAct.p===op&&prevAct.t==='check'){
+      await nextPhase(s);
+    } else {
+      await push(s);
+    }
     return;
   }
 
@@ -609,10 +623,13 @@ async function act(type, amount, s){
     s.pot+=callAmt;
     s.actions.push({p:me,t:'call',a:callAmt});
     s.toAct=op;
-    // Après call en preflop: si on est SB et on call la BB → BB peut encore raise
-    // Après call en post-flop → round terminé
-    if(s.phase==='preflop'&&me===s.sb&&s.lastAggressor===s.bb){
-      // BB peut encore agir
+    // Preflop : SB call → BB a encore l'option (peut check ou raise)
+    // Preflop : BB call (après reraise de SB) → round terminé
+    // Post-flop : call → round terminé
+    const sbJustCalled = s.phase==='preflop' && me===s.sb && s.bbHasOption;
+    if(sbJustCalled){
+      // Laisser BB agir (option)
+      s.bbHasOption=false; // BB va voir toAct=bb
       await push(s);
     } else {
       await nextPhase(s);
@@ -629,6 +646,7 @@ async function act(type, amount, s){
     s.bets[me]=newBet;
     s.pot+=raiseAmt;
     s.lastAggressor=me;
+    s.bbHasOption=false; // Si raise, l'option BB est annulée
     s.actions.push({p:me,t:'raise',a:raiseAmt,total:newBet});
     s.toAct=op;
     await push(s);
@@ -640,19 +658,24 @@ async function nextPhase(s){
   const order=['preflop','flop','turn','river','showdown'];
   const idx=order.indexOf(s.phase);
   s.phase=order[idx+1];
-  // Reset bets
   s.bets={p1:0,p2:0};
   s.currentBet=0;
   s.lastRaiseSize=BB_AMT;
   s.lastAggressor=null;
+  s.bbHasOption=false;
   s.actions=[];
-  // Post-flop en heads-up: BB (= non-dealer) parle EN PREMIER
-  // BB = opp(dealer) = opp(sb)
+  // Post-flop heads-up : BB (non-dealer) parle EN PREMIER
   s.toAct=s.bb;
-  // Révéler cartes
   if(s.phase==='flop') s.revealed=3;
   else if(s.phase==='turn') s.revealed=4;
-  else if(s.phase==='river'||s.phase==='showdown') s.revealed=5;
+  else if(s.phase==='river') s.revealed=5;
+  else if(s.phase==='showdown'){
+    s.revealed=5;
+    // p1 calcule le résultat showdown
+    if(myColor==='p1') await computeAndWriteResult(s);
+    else await push(s);
+    return;
+  }
   await push(s);
 }
 
@@ -661,105 +684,123 @@ async function push(s){
 }
 
 // ══════════════════════════════════
-// RÉSULTAT
+// CALCUL RÉSULTAT (seulement p1 écrit)
+// Réaction côté p2: via onValue → status='ended'
 // ══════════════════════════════════
-function showResult(s){
-  const me=myColor, op=opp(me);
-  const modal=document.getElementById('result-modal');
-  const handsEl=document.getElementById('res-hands');
-  handsEl.innerHTML='';
-
+async function computeAndWriteResult(s){
   let winner=null;
+  let p1handName='', p2handName='';
 
   if(s.foldedBy){
-    // Fold: gagnant immédiat sans showdown
     winner=opp(s.foldedBy);
-    document.getElementById('res-title').textContent='Fold';
-    const div=document.createElement('div');
-    div.className='sd-hand';
-    const fName=s.foldedBy==='p1'?s.p1name:s.p2name;
-    div.innerHTML=`<div class="sdn">${fName}</div><div class="sdh" style="color:var(--red2)">A foldé</div>`;
-    handsEl.appendChild(div);
   } else {
-    // Showdown: comparer mains
-    document.getElementById('res-title').textContent='Showdown';
+    // Showdown
     const comm=s.community.map(c=>parseCard(c));
     const p1h=s.p1hand.map(c=>parseCard(c));
     const p2h=s.p2hand.map(c=>parseCard(c));
     const p1b=bestHand([...p1h,...comm]);
     const p2b=bestHand([...p2h,...comm]);
+    p1handName=p1b.name; p2handName=p2b.name;
     const cmp=cmpVal(p1b.val,p2b.val);
     if(cmp>0) winner='p1'; else if(cmp<0) winner='p2';
+  }
 
-    for(const [pid,hand,best] of [['p1',p1h,p1b],['p2',p2h,p2b]]){
+  const newStacks={...s.stacks};
+  if(winner) newStacks[winner]+=s.pot;
+  else { newStacks.p1+=Math.floor(s.pot/2); newStacks.p2+=Math.ceil(s.pot/2); }
+
+  const gameEnded=newStacks.p1<=0||newStacks.p2<=0;
+
+  const result={
+    winner,         // 'p1'|'p2'|null (égalité)
+    pot:s.pot,
+    foldedBy:s.foldedBy||null,
+    p1handName, p2handName,
+    newStacks,
+    gameEnded,
+    gameWinner: gameEnded?(newStacks.p1>0?'p1':'p2'):null,
+  };
+
+  // Écrire l'état final + résultat dans Firebase en une seule passe
+  await update(gameRef,{
+    state: JSON.stringify({...s, revealed:5}),
+    result: JSON.stringify(result),
+    status:'ended',
+  });
+}
+
+// ══════════════════════════════════
+// AFFICHAGE RÉSULTAT (lu depuis Firebase)
+// ══════════════════════════════════
+function showResult(s, result){
+  const modal=document.getElementById('result-modal');
+  const handsEl=document.getElementById('res-hands');
+  handsEl.innerHTML='';
+
+  if(result.foldedBy){
+    document.getElementById('res-title').textContent='Fold';
+    const div=document.createElement('div');
+    div.className='sd-hand';
+    const fName=result.foldedBy==='p1'?s.p1name:s.p2name;
+    div.innerHTML=`<div class="sdn">${fName}</div><div class="sdh" style="color:var(--red2)">A foldé</div>`;
+    handsEl.appendChild(div);
+  } else {
+    document.getElementById('res-title').textContent='Showdown';
+    const comm=s.community.map(c=>parseCard(c));
+    for(const pid of ['p1','p2']){
+      const hand=(pid==='p1'?s.p1hand:s.p2hand).map(c=>parseCard(c));
+      const handName=pid==='p1'?result.p1handName:result.p2handName;
+      const isW=result.winner===pid;
       const div=document.createElement('div');
       div.className='sd-hand';
-      const nm=pid==='p1'?s.p1name:s.p2name;
-      const isW=winner===pid;
-      div.innerHTML=`<div class="sdn">${nm}${isW?' 🏆':''}</div>`;
+      div.innerHTML=`<div class="sdn">${pid==='p1'?s.p1name:s.p2name}${isW?' 🏆':''}</div>`;
       const dc=document.createElement('div');dc.className='sdc';
       hand.forEach(c=>{
         const ce=mkCard(c.r+c.s);
         ce.style.width='40px';ce.style.height='58px';dc.appendChild(ce);
       });
       div.appendChild(dc);
-      div.innerHTML+=`<div class="sdh">${best.name}</div>`;
+      div.innerHTML+=`<div class="sdh">${handName}</div>`;
       handsEl.appendChild(div);
     }
   }
 
-  // Calculer nouveaux stacks
-  const newStacks={...s.stacks};
-  if(winner){
-    newStacks[winner]+=s.pot;
-  } else {
-    newStacks.p1+=Math.floor(s.pot/2);
-    newStacks.p2+=Math.ceil(s.pot/2);
-  }
-
-  const winName=winner?(winner==='p1'?s.p1name:s.p2name):null;
+  const winName=result.winner?(result.winner==='p1'?s.p1name:s.p2name):null;
   document.getElementById('res-winner').textContent=
-    winner?`🏆 ${winName} remporte le pot !`:'Égalité — pot partagé';
-  document.getElementById('res-pot').textContent=`Pot: ${s.pot} jetons`;
+    result.winner?`🏆 ${winName} remporte le pot !`:'Égalité — pot partagé';
+  document.getElementById('res-pot').textContent=`Pot: ${result.pot} jetons`;
 
-  // Stocker les nouveaux stacks dans l'état pour nextHand
-  s._newStacks=newStacks;
-  s._winner=winner;
-  document.getElementById('btn-next')._state=s;
-
-  // Fin de partie?
-  if(newStacks.p1<=0||newStacks.p2<=0){
-    document.getElementById('btn-next').textContent='Voir le résultat final';
-  }
+  const btnNext=document.getElementById('btn-next');
+  btnNext._result=result;
+  btnNext._state=s;
+  btnNext.textContent=result.gameEnded?'Voir le résultat final →':'Main suivante →';
 
   modal.classList.add('show');
 }
 
 window.nextHand=async function(){
+  const result=document.getElementById('btn-next')._result;
   const s=document.getElementById('btn-next')._state;
-  const newStacks=s._newStacks;
   document.getElementById('result-modal').classList.remove('show');
   resultShown=false;
 
-  // Fin de partie?
-  if(newStacks.p1<=0||newStacks.p2<=0){
-    const gw=newStacks.p1>0?'p1':'p2';
+  if(result.gameEnded){
+    const gw=result.gameWinner;
     const gwName=gw==='p1'?s.p1name:s.p2name;
     document.getElementById('end-trophy').textContent=gw===myColor?'🏆':'💀';
     document.getElementById('end-title').textContent=gw===myColor?'Victoire !':'Défaite';
-    document.getElementById('end-msg').textContent=`${gwName} remporte la partie avec tous les jetons !\n\nStacks finaux — ${s.p1name}: ${newStacks.p1} · ${s.p2name}: ${newStacks.p2}`;
+    document.getElementById('end-msg').textContent=
+      `${gwName} remporte la partie avec tous les jetons !\nStacks finaux — ${s.p1name}: ${result.newStacks.p1} · ${s.p2name}: ${result.newStacks.p2}`;
     document.getElementById('end-modal').classList.add('show');
     await update(gameRef,{status:'done'});
     return;
   }
 
-  // Prochaine main: mettre stacks à jour et dealer deal
-  const snap=await get(gameRef);
-  const d=snap.val();
-  const curState=JSON.parse(d.state);
-  curState.stacks=newStacks;
-  await update(gameRef,{status:'ready', state:JSON.stringify(curState)});
-  if(myColor==='p1') await dealHand({...d, state:JSON.stringify(curState)});
+  // Préparer prochaine main: p1 deal
+  // On passe les nouveaux stacks dans un état intermédiaire
+  const nextState={...s, stacks:result.newStacks};
+  await update(gameRef,{status:'ready', state:JSON.stringify(nextState), result:null});
+  if(myColor==='p1') await dealHand({p1:s.p1name, p2:s.p2name, state:JSON.stringify(nextState)});
 };
 
 // NOTIF
